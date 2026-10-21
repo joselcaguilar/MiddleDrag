@@ -173,6 +173,11 @@ class DeviceMonitor: TouchDeviceProviding {
                 let devicePtr = unsafe CFArrayGetValueAtIndex(deviceList, i)
                 if let dev = unsafe devicePtr {
                     let deviceRef = unsafe UnsafeMutableRawPointer(mutating: dev)
+                    // deviceList is released when start() returns, so own a reference for as
+                    // long as the device is registered (balanced in stop()). Otherwise the
+                    // framework's worker thread (mt_ThreadedMTEntry) holds the last reference
+                    // and runs the device finalizer concurrently with our MTDeviceStop.
+                    _ = unsafe Unmanaged<AnyObject>.fromOpaque(deviceRef).retain()
                     unsafe MTRegisterContactFrameCallback(deviceRef, deviceContactCallback)
                     unsafe MTDeviceStart(deviceRef, 0)
                     unsafe registeredDevices.insert(deviceRef)
@@ -187,7 +192,9 @@ class DeviceMonitor: TouchDeviceProviding {
             Log.warning("MTDeviceCreateList returned nil, trying default device", category: .device)
         }
 
-        // Also try the default device if not already registered
+        // Also try the default device if not already registered.
+        // MTDeviceCreateDefault follows the Create rule, so we already own this reference:
+        // it is kept for the registration (balanced in stop()) or released right away.
         if let defaultDevice = unsafe MultitouchFramework.shared.getDefaultDevice() {
             if unsafe !registeredDevices.contains(defaultDevice) {
                 unsafe MTRegisterContactFrameCallback(defaultDevice, deviceContactCallback)
@@ -199,6 +206,7 @@ class DeviceMonitor: TouchDeviceProviding {
                     unsafe device = unsafe defaultDevice
                 }
             } else {
+                unsafe Unmanaged<AnyObject>.fromOpaque(defaultDevice).release()
                 Log.debug("Default device already registered from device list", category: .device)
             }
         }
@@ -302,19 +310,19 @@ class DeviceMonitor: TouchDeviceProviding {
         unsafe DeviceMonitor.lifecycleLock.lock()
         defer { unsafe DeviceMonitor.lifecycleLock.unlock() }
 
-        // Now safe to stop devices. Guard each stop with MTDeviceIsRunning to prevent
-        // CFRelease(NULL) → EXC_BREAKPOINT crashes: if the framework's internal thread
-        // (mt_ThreadedMTEntry) already tore down a device handle (e.g. during sleep/wake
-        // or physical disconnect), calling MTDeviceStop on the same handle causes a
-        // double-release of the underlying CF object, which CoreFoundation traps as
-        // CFRelease(NULL) in CFRelease.cold.2. Skipping the stop when the handle is
-        // already not-running closes this window without affecting normal teardown.
+        // Now safe to stop devices. Our reference from start() is released only after
+        // MTDeviceStop has returned. If the worker thread (mt_ThreadedMTEntry) dropped the
+        // last reference instead, the device finalizer (__MTDeviceRelease → MTDeviceStop)
+        // would run on that thread while this MTDeviceStop is still tearing the device down,
+        // double-releasing its CF objects (CFRelease.cold.2 / CFMachPortGetPort crashes
+        // seen after wake, when restart() calls stop()).
         for unsafe deviceRef in unsafe devicesToStop {
             unsafe os_unfair_lock_lock(&gCallbackLock)
             if unsafe MTDeviceIsRunning(deviceRef) {
                 unsafe MTDeviceStop(deviceRef)
             }
             unsafe os_unfair_lock_unlock(&gCallbackLock)
+            unsafe Unmanaged<AnyObject>.fromOpaque(deviceRef).release()
         }
 
         Log.info("DeviceMonitor stopped", category: .device)
